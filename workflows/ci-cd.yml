@@ -1,0 +1,172 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: credpal
+  ECS_CLUSTER: credpal-cluster
+  ECS_SERVICE: API
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: credpal_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test -- --coverage
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/lcov.info
+
+  build-and-push:
+    name: Build & Push to ECR
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  security-scan:
+    name: Security Scan
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  deploy-production:
+    name: Deploy to Production
+    needs: [build-and-push, security-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update task definition with placeholder values
+        id: task-def
+        run: |
+          # Replace placeholder values
+          sed -i "s|ACCOUNT_ID|${{ secrets.AWS_ACCOUNT_ID }}|g" \
+          sed -i "s|SECRET_ARN|${{ secrets.SECRETS_MANAGER_ARN }}|g" \
+          sed -i "s|REPO_URL|${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}|g" \
+          sed -i "s|AWS_REGION|${{ env.AWS_REGION }}|g" \
+          sed -i "s|TASKS_ROLE_ARN|${{ secrets.TASKS_ROLE_ARN }}|g" \
+          sed -i "s|EXECUTION_ROLE_ARN|${{ secrets.EXECUTION_ROLE_ARN }}|g" \
+          .aws/task.json
+          
+      - name: Register new ECS task definition with updated image names
+        run: |
+          jq \
+            --arg api_image "$ECR_REGISTRY/$ECR_REPOSITORY:$LATEST" \
+            (.containerDefinitions[] | select(.name == "api-dev-container").image) |= $api_image |
+            .aws/task.json
+          
+          aws ecs register-task-definition \
+            --region ${{ env.AWS_REGION }} \
+            --cli-input-json file:/.aws/task.json \
+            > task-def-response.json
+
+      - name: Deploy updated tasks to ECS Production
+        run: |
+          NEW_TASK_DEF_ARN=$(jq -r '.taskDefinition.taskDefinitionArn' task-def-response.json)
+          aws ecs update-service \
+            --region ${{ env.AWS_REGION }} \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition $NEW_TASK_DEF_ARN
+
+      - name: Wait for service stabilization
+        run: |
+          aws ecs wait services-stable \
+            --region ${{ secrets.AWS_REGION }} \
+            --cluster ${{ env.CLUSTER_NAME }} \
+            --services ${{ env.ECS_SERVICE }}
+
+          echo "✅ ECS service deployment complete and stable."
